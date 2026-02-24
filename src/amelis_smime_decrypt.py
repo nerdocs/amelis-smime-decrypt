@@ -7,7 +7,9 @@ from email.message import EmailMessage
 from email.parser import BytesParser
 
 from dotenv import load_dotenv
-from M2Crypto import BIO, SMIME, X509, EVP
+from cryptography.hazmat.primitives.serialization import pkcs12
+from cryptography.hazmat.backends import default_backend
+from endesive import email as endesive_email
 
 load_dotenv()
 
@@ -24,6 +26,8 @@ SAVE_DIRECTORY = os.getenv("SAVE_DIRECTORY")
 # S/MIME decryption keys
 PRIVATE_KEY_PATH = os.getenv("PRIVATE_KEY_PATH")
 CERTIFICATE_PATH = os.getenv("CERTIFICATE_PATH")
+P12_CERTIFICATE_PATH = os.getenv("P12_CERTIFICATE_PATH")
+PFX_PASSWORD = os.getenv("PFX_PASSWORD", "")
 
 
 def connect_to_mailbox() -> imaplib.IMAP4_SSL | None:
@@ -42,7 +46,7 @@ def connect_to_mailbox() -> imaplib.IMAP4_SSL | None:
 def fetch_unread_mails(
     mail: imaplib.IMAP4, subject_keyword: str, only_unseen: bool = False
 ) -> list[str]:
-    """Fetch emails that contain a specific keyword in the subject."""
+    """Fetch emails ids that contain a specific keyword in the subject."""
     try:
         # Search for emails with subject containing the keyword
         if only_unseen:
@@ -69,40 +73,72 @@ def fetch_unread_mails(
         return []
 
 
-def load_smime_keys():
-    """Load S/MIME private key and certificate."""
-    smime = SMIME.SMIME()
-    smime.load_key(PRIVATE_KEY_PATH, CERTIFICATE_PATH)
-    return smime
+def load_private_key():
+    """Load private key from P12 file."""
+    import os
 
+    # Try P12 file first
+    if P12_CERTIFICATE_PATH and os.path.exists(P12_CERTIFICATE_PATH):
+        p12_path = (
+            P12_CERTIFICATE_PATH
+            if os.path.isabs(P12_CERTIFICATE_PATH)
+            else os.path.abspath(P12_CERTIFICATE_PATH)
+        )
+        logger.debug(f"Loading P12: {p12_path}")
 
-def decrypt_smime(encrypted_data: bytes) -> bytes | None:
-    """Decrypt S/MIME encrypted data using M2Crypto."""
-    try:
-        smime = load_smime_keys()
-
-        logger.debug(f"Encrypted data length: {len(encrypted_data)} bytes")
-
-        # Create a BIO buffer from the encrypted data
-        bio = BIO.MemoryBuffer(encrypted_data)
-
-        # Load the PKCS7 object from the encrypted data
         try:
-            p7, _data = SMIME.smime_load_pkcs7_bio(bio)
-        except SMIME.SMIME_Error as e:
-            logger.error(f"SMIME_Error loading PKCS7: {e}")
+            with open(p12_path, "rb") as f:
+                p12_data = f.read()
+
+            password = PFX_PASSWORD.encode() if PFX_PASSWORD else b""
+            private_key, certificate, additional_certs = (
+                pkcs12.load_key_and_certificates(
+                    p12_data, password, backend=default_backend()
+                )
+            )
+
+            logger.debug(f"Loaded private key from P12")
+            return private_key
+
+        except Exception as e:
+            logger.error(f"Failed to load P12: {e}")
             return None
 
-        # Decrypt the PKCS7 data
-        decrypted_bio = smime.decrypt(p7)
+    logger.error("No P12 certificate file configured or found")
+    return None
 
-        # Read the decrypted bytes
-        decrypted_data = decrypted_bio.read()
+
+def decrypt_smime(encrypted_part: EmailMessage) -> bytes | None:
+    """
+    Decrypt S/MIME encrypted email part using endesive library.
+
+    This handles RSA-OAEP and modern encryption schemes properly.
+    """
+    try:
+        # Load private key from P12
+        private_key = load_private_key()
+        if not private_key:
+            logger.error("Failed to load private key")
+            return None
+
+        # Get the entire encrypted message part as string
+        # endesive needs the full MIME part
+        part_bytes = encrypted_part.as_bytes()
+        part_string = part_bytes.decode("utf-8", errors="replace")
+
+        logger.debug(f"Encrypted part length: {len(part_string)} bytes")
+
+        # Decrypt using endesive
+        decrypted_data = endesive_email.decrypt(part_string, private_key)
 
         logger.debug(f"Successfully decrypted {len(decrypted_data)} bytes")
         return decrypted_data
+
     except Exception as e:
         logger.error(f"Decryption failed: {e}")
+        import traceback
+
+        logger.debug(traceback.format_exc())
         return None
 
 
@@ -177,15 +213,8 @@ def process_email(mail: imaplib.IMAP4_SSL, email_id: str) -> None:
         mail.store(email_id, "-FLAGS", "\\Seen")
         return
 
-    # Get the encrypted payload
-    encrypted_data = encrypted_part.get_payload(decode=True)
-
-    if not encrypted_data:
-        logger.error("Failed to get encrypted payload from email")
-        return
-
-    # Decrypt the S/MIME data
-    decrypted_data = decrypt_smime(encrypted_data)
+    # Decrypt the S/MIME data (pass the entire part, not just payload)
+    decrypted_data = decrypt_smime(encrypted_part)
 
     if not decrypted_data:
         logger.error(f"Failed to decrypt email: {subject}")
@@ -211,60 +240,49 @@ def process_email(mail: imaplib.IMAP4_SSL, email_id: str) -> None:
     mail.store(email_id, "-FLAGS", "\\Seen")
 
 
-def check_key_and_cert(private_key_path, certificate_path) -> bool:
+def check_p12_file() -> bool:
     """
-    Check if the private key and certificate are valid and match.
+    Check if the P12 certificate file exists and can be loaded.
 
-    :param private_key_path: Path to the private key file
-    :param certificate_path: Path to the certificate file
     :return: True if valid, False otherwise
     """
     try:
-        # Check if files exist
-        if not os.path.exists(private_key_path):
-            logger.critical(f"Private key file '{private_key_path}' does not exist.")
-            return False
-        if not os.path.exists(certificate_path):
-            logger.critical(f"Certificate file '{certificate_path}' does not exist.")
+        if not P12_CERTIFICATE_PATH:
+            logger.critical("P12_CERTIFICATE_PATH not configured in .env")
             return False
 
-        # Load private key
-        pkey = EVP.load_key(private_key_path)
-        if not pkey:
-            logger.critical("Failed to load private key.")
+        p12_path = (
+            P12_CERTIFICATE_PATH
+            if os.path.isabs(P12_CERTIFICATE_PATH)
+            else os.path.abspath(P12_CERTIFICATE_PATH)
+        )
+
+        if not os.path.exists(p12_path):
+            logger.critical(f"P12 file '{p12_path}' does not exist.")
             return False
 
-        # Load certificate
-        cert = X509.load_cert(certificate_path)
-        if not cert:
-            logger.critical("Failed to load certificate.")
+        # Try to load it
+        with open(p12_path, "rb") as f:
+            p12_data = f.read()
+
+        password = PFX_PASSWORD.encode() if PFX_PASSWORD else b""
+        private_key, certificate, additional_certs = pkcs12.load_key_and_certificates(
+            p12_data, password, backend=default_backend()
+        )
+
+        if not private_key:
+            logger.critical("Failed to load private key from P12.")
             return False
 
-        # Check if the private key matches the certificate
-        cert_pubkey = cert.get_pubkey()
-        cert_rsa = cert_pubkey.get_rsa()
-        pkey_rsa = pkey.get_rsa()
-
-        if cert_rsa.e != pkey_rsa.e or cert_rsa.n != pkey_rsa.n:
-            logger.critical("Private key does not match the certificate.")
+        if not certificate:
+            logger.critical("Failed to load certificate from P12.")
             return False
 
-        # Check certificate expiration
-        not_before = cert.get_not_before().get_datetime().replace(tzinfo=None)
-        not_after = cert.get_not_after().get_datetime().replace(tzinfo=None)
-        now = datetime.now()
-
-        if now < not_before:
-            logger.critical("Certificate is not yet valid.")
-            return False
-        if now > not_after:
-            logger.critical("Certificate has expired.")
-            return False
-
+        logger.info(f"P12 certificate loaded successfully: {certificate.subject}")
         return True
 
     except Exception as e:
-        logger.critical(f"Error checking key and certificate: {e}")
+        logger.critical(f"Error loading P12 file: {e}")
         return False
 
 
@@ -276,7 +294,7 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    if not check_key_and_cert(PRIVATE_KEY_PATH, CERTIFICATE_PATH):
+    if not check_p12_file():
         return
 
     if not os.path.exists(SAVE_DIRECTORY):

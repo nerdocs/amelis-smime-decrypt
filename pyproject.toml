@@ -16,9 +16,9 @@ keywords = ["email", "smime", "decryption", "imap", "attachments"]
 
 dependencies = [
     "imapclient",
-    "M2Crypto",
-    "six",
     "python-dotenv",
+    "cryptography",
+    "endesive",
 ]
 
 [project.optional-dependencies]
