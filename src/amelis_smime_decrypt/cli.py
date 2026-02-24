@@ -15,6 +15,7 @@ from amelis_smime_decrypt.certificate import SMIMECertificate
 from amelis_smime_decrypt.imap import MailboxClient, EmailAction
 from amelis_smime_decrypt.smime import decrypt_email
 from amelis_smime_decrypt.attachment import extract_attachments
+from amelis_smime_decrypt.pdf_parser import rename_pdf
 
 # Load environment variables
 load_dotenv()
@@ -47,7 +48,7 @@ def get_email_timestamp(msg: EmailMessage) -> datetime:
 
 
 def deduplicate_emails_by_subject(
-    emails: List[Tuple[str, EmailMessage]]
+    emails: List[Tuple[str, EmailMessage]],
 ) -> Tuple[List[Tuple[str, EmailMessage]], List[Tuple[str, EmailMessage]]]:
     """
     Group emails by subject and return only the latest email per subject.
@@ -232,19 +233,24 @@ Action formats:
         dest="duplicate_action",
         help='Action for older duplicate emails (same subject): mark_seen|delete|move:Folder (default: from .env DUPLICATE_ACTION or "mark_seen")',
     )
+    process_group.add_argument(
+        "--rename",
+        dest="rename_pattern",
+        help="Rename PDFs using pattern with variables: {last_name}, {first_name}, {birth_date}, {barcode_number}, {samplecollectiondate}, {receiptdate}, {finalreport}, {samplecollectiondate_yyyymmdd}, {receiptdate_yyyymmdd}, {finalreport_yyyymmdd} (default: from .env RENAME_PATTERN)",
+    )
 
     # General options
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable verbose/debug logging"
     )
-    parser.add_argument(
-        "--version", action="version", version="%(prog)s 0.2.0"
-    )
+    parser.add_argument("--version", action="version", version="%(prog)s 0.2.0")
 
     return parser.parse_args()
 
 
-def get_config_value(cli_value: Optional[str], env_key: str, default: str = None) -> Optional[str]:
+def get_config_value(
+    cli_value: Optional[str], env_key: str, default: str = None
+) -> Optional[str]:
     """
     Get configuration value with priority: CLI arg > .env > default.
 
@@ -277,15 +283,24 @@ def main():
 
     # Load configuration: CLI args override .env values
     imap_server = get_config_value(args.imap_server, "IMAP_SERVER")
-    imap_port = args.imap_port if args.imap_port is not None else int(os.getenv("IMAP_PORT", 993))
+    imap_port = (
+        args.imap_port
+        if args.imap_port is not None
+        else int(os.getenv("IMAP_PORT", 993))
+    )
     email_account = get_config_value(args.imap_user, "EMAIL_ACCOUNT")
     email_password = get_config_value(args.imap_pass, "EMAIL_PASSWORD")
     p12_cert_path = get_config_value(args.cert_path, "P12_CERTIFICATE_PATH")
     pfx_password = get_config_value(args.cert_password, "PFX_PASSWORD", "")
     save_directory = get_config_value(args.output_dir, "SAVE_DIRECTORY", "./output")
-    subject_keyword = get_config_value(args.subject_keyword, "SUBJECT_KEYWORD", "Auftrag")
+    subject_keyword = get_config_value(
+        args.subject_keyword, "SUBJECT_KEYWORD", "Auftrag"
+    )
     email_action_str = get_config_value(args.email_action, "EMAIL_ACTION", "mark_seen")
-    duplicate_action_str = get_config_value(args.duplicate_action, "DUPLICATE_ACTION", "mark_seen")
+    duplicate_action_str = get_config_value(
+        args.duplicate_action, "DUPLICATE_ACTION", "mark_seen"
+    )
+    rename_pattern = get_config_value(args.rename_pattern, "RENAME_PATTERN")
 
     # Validate required configuration
     if not all([imap_server, email_account, email_password, p12_cert_path]):
@@ -305,6 +320,12 @@ def main():
     logger.info(f"Duplicate email action: {duplicate_action.value}")
     if duplicate_folder:
         logger.info(f"Duplicate target folder: {duplicate_folder}")
+
+    # Log rename configuration
+    if rename_pattern:
+        logger.info(f"PDF rename pattern: {rename_pattern}")
+    else:
+        logger.info("PDF renaming disabled (no pattern specified)")
 
     # Load S/MIME certificate
     try:
@@ -339,7 +360,9 @@ def main():
             # Deduplicate emails by subject (keep only latest per subject)
             emails, duplicates = deduplicate_emails_by_subject(all_emails)
 
-            logger.info(f"Processing {len(emails)} unique email(s) after deduplication...")
+            logger.info(
+                f"Processing {len(emails)} unique email(s) after deduplication..."
+            )
 
             # Handle duplicate emails first
             if duplicates:
@@ -373,6 +396,20 @@ def main():
                         logger.info(
                             f"Saved {len(saved_files)} attachment(s) from: {subject}"
                         )
+
+                        # Rename PDFs if pattern is specified
+                        if rename_pattern:
+                            for pdf_path in saved_files:
+                                try:
+                                    new_path = rename_pdf(pdf_path, rename_pattern)
+                                    if new_path:
+                                        logger.debug(
+                                            f"Renamed PDF: {pdf_path} -> {new_path}"
+                                        )
+                                except Exception as e:
+                                    logger.error(
+                                        f"Failed to rename PDF {pdf_path}: {e}"
+                                    )
                     else:
                         logger.warning(f"No PDF attachments found in: {subject}")
 
