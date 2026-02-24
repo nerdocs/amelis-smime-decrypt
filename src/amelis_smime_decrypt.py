@@ -42,17 +42,31 @@ def connect_to_mailbox() -> imaplib.IMAP4_SSL | None:
 def fetch_unread_mails(
     mail: imaplib.IMAP4, subject_keyword: str, only_unseen: bool = False
 ) -> list[str]:
-    """Fetch unread emails that contain a specific keyword in the subject."""
-    # Construct the search criteria (e.g., "UNSEEN SUBJECT 'keyword'")
-    unseen = "UNSEEN " if only_unseen else ""
+    """Fetch emails that contain a specific keyword in the subject."""
+    try:
+        # Search for emails with subject containing the keyword
+        if only_unseen:
+            status, messages = mail.search(
+                None, "UNSEEN", f'SUBJECT "{subject_keyword}"'
+            )
+        else:
+            status, messages = mail.search(None, f'SUBJECT "{subject_keyword}"')
 
-    search_criteria = f'({unseen}SUBJECT "{subject_keyword}")'
-    status, messages = mail.search(None, search_criteria)
-    if status != "OK":
+        logger.debug(f"Search status: {status}, keyword: '{subject_keyword}'")
+
+        if status != "OK":
+            logger.error(f"IMAP search failed with status: {status}")
+            return []
+
+        email_ids = messages[0].decode().split()
+        logger.info(
+            f"Found {len(email_ids)} email(s) with subject containing '{subject_keyword}'"
+        )
+
+        return email_ids
+    except Exception as e:
+        logger.error(f"Error searching for emails: {e}")
         return []
-
-    email_ids = messages[0].decode().split()
-    return email_ids
 
 
 def load_smime_keys():
@@ -62,51 +76,70 @@ def load_smime_keys():
     return smime
 
 
-def decrypt_smime(encrypted_data):
-    """Decrypt an S/MIME encrypted email using M2Crypto."""
+def decrypt_smime(encrypted_data: bytes) -> bytes | None:
+    """Decrypt S/MIME encrypted data using M2Crypto."""
     try:
         smime = load_smime_keys()
 
-        logger.debug(f"🔹 Encrypted data length: {len(encrypted_data)} bytes")
-        logger.debug(f"🔹 First 100 bytes of encrypted data: {encrypted_data[:100]}")
+        logger.debug(f"Encrypted data length: {len(encrypted_data)} bytes")
 
+        # Create a BIO buffer from the encrypted data
         bio = BIO.MemoryBuffer(encrypted_data)
 
-        # TODO: Check if the data is in the correct format
+        # Load the PKCS7 object from the encrypted data
         try:
             p7, _data = SMIME.smime_load_pkcs7_bio(bio)
         except SMIME.SMIME_Error as e:
-            logger.error(f"SMIME_Error occurred: {e}")
+            logger.error(f"SMIME_Error loading PKCS7: {e}")
             return None
 
+        # Decrypt the PKCS7 data
         decrypted_bio = smime.decrypt(p7)
 
-        return decrypted_bio
+        # Read the decrypted bytes
+        decrypted_data = decrypted_bio.read()
+
+        logger.debug(f"Successfully decrypted {len(decrypted_data)} bytes")
+        return decrypted_data
     except Exception as e:
-        logger.error(f"❌ Decryption failed: {e}")
+        logger.error(f"Decryption failed: {e}")
         return None
 
 
-def process_smime_attachment_email(msg: EmailMessage) -> None:
-    """Extract and decrypt S/MIME email attachment (smime.p7m)."""
+def save_attachments_from_email(msg: EmailMessage, subject: str) -> int:
+    """Extract and save all PDF attachments from a decrypted email."""
+    saved_count = 0
 
     for part in msg.walk():
-        decoded_payload = part.get_payload(decode=True)  # .decode("iso8859")
+        content_type = part.get_content_type()
+        filename = part.get_filename()
 
-        logger.debug(f"Attachment size: {len(decoded_payload)} bytes")
-        logger.debug(f"🔹 First 100 bytes of attachment: {decoded_payload[:100]}")
+        # Save PDF attachments
+        if content_type == "application/pdf" or (
+            filename and filename.lower().endswith(".pdf")
+        ):
+            if not filename:
+                filename = f"attachment_{saved_count + 1}.pdf"
 
-        decrypted_content = decrypt_smime(decoded_payload)
-        if decrypted_content:
-            logger.info("✅ Successfully decrypted attachment email:")
-            # TODO: save attachment to output directory
-            # TODO: name output file after patient name
-            # For example, save it or extract further attachments
-        else:
-            logger.error("❌ Attachment email decryption failed.")
-        return
+            # Sanitize filename
+            safe_filename = "".join(c for c in filename if c.isalnum() or c in "._- ")
 
-    logger.error("❌ No valid S/MIME attachment found.")
+            # Create timestamped filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_filename = f"{timestamp}_{safe_filename}"
+            output_path = os.path.join(SAVE_DIRECTORY, output_filename)
+
+            try:
+                attachment_data = part.get_payload(decode=True)
+                if attachment_data:
+                    with open(output_path, "wb") as f:
+                        f.write(attachment_data)
+                    logger.info(f"Saved attachment: {output_path}")
+                    saved_count += 1
+            except Exception as e:
+                logger.error(f"Failed to save attachment {filename}: {e}")
+
+    return saved_count
 
 
 def process_email(mail: imaplib.IMAP4_SSL, email_id: str) -> None:
@@ -119,11 +152,62 @@ def process_email(mail: imaplib.IMAP4_SSL, email_id: str) -> None:
 
     raw_email: bytes = msg_data[0][1]  # noqa
     msg: EmailMessage = BytesParser(policy=policy.default).parsebytes(raw_email)
-    print(f"Processing Mail: {msg['Subject']}")
-    if msg.get_content_type() == "application/pkcs7-mime" and msg.is_attachment():
-        process_smime_attachment_email(msg)
+    subject = msg.get("Subject", "No Subject")
 
-    # DEBUG: restore "unseen" status
+    logger.info(f"Processing email: {subject}")
+
+    # Find S/MIME encrypted part (could be top-level or nested in multipart)
+    encrypted_part = None
+
+    if msg.get_content_type() == "application/pkcs7-mime":
+        # Entire message is encrypted
+        encrypted_part = msg
+    elif msg.is_multipart():
+        # Search for encrypted part in multipart message
+        for part in msg.walk():
+            if part.get_content_type() == "application/pkcs7-mime":
+                encrypted_part = part
+                break
+
+    if not encrypted_part:
+        logger.warning(
+            f"No S/MIME encrypted content found (Content-Type: {msg.get_content_type()})"
+        )
+        # DEBUG: restore "unseen" status to keep email as unread
+        mail.store(email_id, "-FLAGS", "\\Seen")
+        return
+
+    # Get the encrypted payload
+    encrypted_data = encrypted_part.get_payload(decode=True)
+
+    if not encrypted_data:
+        logger.error("Failed to get encrypted payload from email")
+        return
+
+    # Decrypt the S/MIME data
+    decrypted_data = decrypt_smime(encrypted_data)
+
+    if not decrypted_data:
+        logger.error(f"Failed to decrypt email: {subject}")
+        return
+
+    # Parse the decrypted email
+    try:
+        decrypted_msg = BytesParser(policy=policy.default).parsebytes(decrypted_data)
+        logger.info(f"Successfully decrypted email: {subject}")
+
+        # Extract and save attachments
+        saved_count = save_attachments_from_email(decrypted_msg, subject)
+
+        if saved_count > 0:
+            logger.info(f"Saved {saved_count} attachment(s) from email: {subject}")
+        else:
+            logger.warning(f"No PDF attachments found in email: {subject}")
+
+    except Exception as e:
+        logger.error(f"Failed to parse decrypted email: {e}")
+
+    # DEBUG: restore "unseen" status to keep email as unread
     mail.store(email_id, "-FLAGS", "\\Seen")
 
 
@@ -184,57 +268,36 @@ def check_key_and_cert(private_key_path, certificate_path) -> bool:
         return False
 
 
-def decrypt_smime_data(encrypted_data) -> bytes | None:
-    """
-    Decrypt S/MIME encrypted data.
-
-    :param encrypted_data: Bytes object containing the S/MIME encrypted data
-    :return: Decrypted data as bytes, or None if decryption fails
-    """
-    try:
-        # Initialize SMIME object
-        smime = load_smime_keys()
-
-        # Create a BIO buffer from the encrypted data
-        in_bio = BIO.MemoryBuffer(encrypted_data)
-
-        # Load the PKCS7 object from the input buffer
-        p7, _ = SMIME.smime_load_pkcs7_bio(in_bio)
-
-        # Decrypt the PKCS7 object
-        out_bio = smime.decrypt(p7)
-
-        # Read the decrypted data from the output buffer
-        decrypted_data = out_bio.read()
-
-        return decrypted_data
-
-    except Exception as e:
-        logger.critical(f"Decryption failed: {e}")
-        return None
-
-
 def main():
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     if not check_key_and_cert(PRIVATE_KEY_PATH, CERTIFICATE_PATH):
         return
 
     if not os.path.exists(SAVE_DIRECTORY):
         os.makedirs(SAVE_DIRECTORY)
+        logger.info(f"Created output directory: {SAVE_DIRECTORY}")
 
     mail = connect_to_mailbox()
     if not mail:
+        logger.error("Failed to connect to mailbox")
         return
 
     email_ids = fetch_unread_mails(mail, os.getenv("SUBJECT_KEYWORD", "Auftrag"))
     if not email_ids:
-        logger.info("No emails found.")
+        logger.info("No emails found matching criteria.")
         return
 
     for email_id in email_ids:
         process_email(mail, email_id)
 
     mail.logout()
+    logger.info("Processing complete.")
 
 
 if __name__ == "__main__":
