@@ -4,8 +4,8 @@ build-backend = "uv_build"
 
 [project]
 name = "amelis-smime-decrypt"
-version = "0.1.0"
-description = "A script to fetch and decrypt S/MIME encrypted emails and extract PDF attachments."
+version = "0.2.0"
+description = "A library and CLI tool to fetch and decrypt S/MIME encrypted emails and extract PDF attachments."
 authors = [
     { name = "Christian Gonzalez", email = "office@nerdocs.at" }
 ]
@@ -29,7 +29,7 @@ dev = [
 ]
 
 [project.scripts]
-amelis-smime-decrypt = "amelis_smime_decrypt:main"
+amelis-smime-decrypt = "amelis_smime_decrypt.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/nerdocs/amelis-smime-decrypt"
