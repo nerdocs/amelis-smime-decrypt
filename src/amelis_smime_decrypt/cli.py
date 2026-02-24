@@ -2,6 +2,11 @@
 
 import logging
 import os
+from collections import defaultdict
+from datetime import datetime
+from email.message import EmailMessage
+from email.utils import parsedate_to_datetime
+from typing import List, Tuple
 from dotenv import load_dotenv
 
 from amelis_smime_decrypt.certificate import SMIMECertificate
@@ -13,6 +18,90 @@ from amelis_smime_decrypt.attachment import extract_attachments
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+def get_email_timestamp(msg: EmailMessage) -> datetime:
+    """
+    Extract timestamp from email message.
+
+    Tries Date header first, falls back to current time if missing/invalid.
+
+    Args:
+        msg: Email message
+
+    Returns:
+        datetime object representing email timestamp
+    """
+    try:
+        date_header = msg.get("Date")
+        if date_header:
+            return parsedate_to_datetime(date_header)
+    except Exception as e:
+        logger.debug(f"Failed to parse Date header: {e}")
+
+    # Fall back to current time if Date header is missing/invalid
+    logger.warning("Email has invalid/missing Date header, using current time")
+    return datetime.now()
+
+
+def deduplicate_emails_by_subject(
+    emails: List[Tuple[str, EmailMessage]]
+) -> Tuple[List[Tuple[str, EmailMessage]], List[Tuple[str, EmailMessage]]]:
+    """
+    Group emails by subject and return only the latest email per subject.
+
+    When multiple emails have the exact same subject, only the most recent
+    email (by Date header timestamp) is kept for processing.
+
+    Args:
+        emails: List of (email_id, EmailMessage) tuples
+
+    Returns:
+        Tuple of:
+            - List of latest emails (one per unique subject)
+            - List of older duplicate emails to handle
+    """
+    # Group emails by subject
+    subject_groups = defaultdict(list)
+
+    for email_id, msg in emails:
+        subject = msg.get("Subject", "").strip()
+        if not subject:
+            subject = "(No Subject)"
+
+        timestamp = get_email_timestamp(msg)
+        subject_groups[subject].append((email_id, msg, timestamp))
+
+    latest_emails = []
+    duplicate_emails = []
+
+    # For each subject group, find the latest email
+    for subject, group in subject_groups.items():
+        if len(group) == 1:
+            # No duplicates, keep the single email
+            email_id, msg, _ = group[0]
+            latest_emails.append((email_id, msg))
+        else:
+            # Sort by timestamp descending (most recent first)
+            group.sort(key=lambda x: x[2], reverse=True)
+
+            # Keep the latest email
+            latest_id, latest_msg, latest_timestamp = group[0]
+            latest_emails.append((latest_id, latest_msg))
+
+            logger.info(
+                f"Found {len(group)} emails with subject '{subject}', "
+                f"using latest from {latest_timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+            # Mark older emails as duplicates
+            for email_id, msg, timestamp in group[1:]:
+                duplicate_emails.append((email_id, msg))
+                logger.debug(
+                    f"  - Duplicate (older): {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+
+    return latest_emails, duplicate_emails
 
 
 def parse_email_action(action_str: str) -> tuple[EmailAction, str | None]:
@@ -65,6 +154,7 @@ def main():
     save_directory = os.getenv("SAVE_DIRECTORY", "./output")
     subject_keyword = os.getenv("SUBJECT_KEYWORD", "Auftrag")
     email_action_str = os.getenv("EMAIL_ACTION", "mark_seen")
+    duplicate_action_str = os.getenv("DUPLICATE_ACTION", "mark_seen")
 
     # Validate required configuration
     if not all([imap_server, email_account, email_password, p12_cert_path]):
@@ -74,11 +164,16 @@ def main():
         )
         return 1
 
-    # Parse email action
+    # Parse email actions
     email_action, target_folder = parse_email_action(email_action_str)
     logger.info(f"Email post-processing action: {email_action.value}")
     if target_folder:
         logger.info(f"Target folder: {target_folder}")
+
+    duplicate_action, duplicate_folder = parse_email_action(duplicate_action_str)
+    logger.info(f"Duplicate email action: {duplicate_action.value}")
+    if duplicate_folder:
+        logger.info(f"Duplicate target folder: {duplicate_folder}")
 
     # Load S/MIME certificate
     try:
@@ -102,14 +197,32 @@ def main():
         ) as mailbox:
 
             # Fetch emails matching criteria
-            emails = mailbox.fetch_emails(subject=subject_keyword, unseen=False)
+            all_emails = mailbox.fetch_emails(subject=subject_keyword, unseen=False)
 
-            if not emails:
+            if not all_emails:
                 logger.info("No emails found matching criteria.")
                 return 0
 
-            logger.info(f"Processing {len(emails)} email(s)...")
+            logger.info(f"Fetched {len(all_emails)} email(s) matching criteria")
 
+            # Deduplicate emails by subject (keep only latest per subject)
+            emails, duplicates = deduplicate_emails_by_subject(all_emails)
+
+            logger.info(f"Processing {len(emails)} unique email(s) after deduplication...")
+
+            # Handle duplicate emails first
+            if duplicates:
+                logger.info(
+                    f"Handling {len(duplicates)} older duplicate email(s) "
+                    f"with action: {duplicate_action.value}"
+                )
+                for dup_id, dup_msg in duplicates:
+                    try:
+                        mailbox.handle_email(dup_id, duplicate_action, duplicate_folder)
+                    except Exception as e:
+                        logger.error(f"Error handling duplicate email {dup_id}: {e}")
+
+            # Process unique emails (latest per subject)
             for email_id, msg in emails:
                 subject = msg.get("Subject", "No Subject")
                 logger.info(f"Processing: {subject}")
