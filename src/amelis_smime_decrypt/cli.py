@@ -1,12 +1,14 @@
 """Command-line interface for amelis-smime-decrypt."""
 
+import argparse
 import logging
 import os
+import sys
 from collections import defaultdict
 from datetime import datetime
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from dotenv import load_dotenv
 
 from amelis_smime_decrypt.certificate import SMIMECertificate
@@ -106,7 +108,7 @@ def deduplicate_emails_by_subject(
 
 def parse_email_action(action_str: str) -> tuple[EmailAction, str | None]:
     """
-    Parse EMAIL_ACTION environment variable.
+    Parse email action string.
 
     Formats:
         - "mark_seen" -> (EmailAction.MARK_SEEN, None)
@@ -114,7 +116,7 @@ def parse_email_action(action_str: str) -> tuple[EmailAction, str | None]:
         - "move:Archive" -> (EmailAction.MOVE_TO_FOLDER, "Archive")
 
     Args:
-        action_str: Action string from environment
+        action_str: Action string from environment or CLI
 
     Returns:
         Tuple of (EmailAction, folder_name)
@@ -134,27 +136,156 @@ def parse_email_action(action_str: str) -> tuple[EmailAction, str | None]:
         return EmailAction.MARK_SEEN, None
 
 
+def parse_arguments() -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+
+    CLI arguments override .env configuration values.
+    """
+    parser = argparse.ArgumentParser(
+        prog="amelis-smime-decrypt",
+        description="Fetch and decrypt S/MIME encrypted emails, extract PDF attachments",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Use .env configuration
+  amelis-smime-decrypt
+
+  # Override specific settings
+  amelis-smime-decrypt --subject "Invoice" --output ./invoices
+
+  # Full CLI configuration (no .env needed)
+  amelis-smime-decrypt \\
+    --imap-server imap.example.com \\
+    --imap-user user@example.com \\
+    --imap-pass secret \\
+    --cert certificate.p12 \\
+    --password pfx_pass \\
+    --subject "Order" \\
+    --output ./orders \\
+    --email-action delete \\
+    --duplicate-action "move:Duplicates"
+
+Action formats:
+  mark_seen              - Mark email as read (default)
+  delete                 - Delete email from mailbox
+  move:FolderName        - Move email to specified IMAP folder
+        """,
+    )
+
+    # IMAP connection settings
+    imap_group = parser.add_argument_group("IMAP Configuration")
+    imap_group.add_argument(
+        "--imap-server",
+        dest="imap_server",
+        help="IMAP server hostname (default: from .env IMAP_SERVER)",
+    )
+    imap_group.add_argument(
+        "--imap-port",
+        dest="imap_port",
+        type=int,
+        help="IMAP server port (default: from .env IMAP_PORT or 993)",
+    )
+    imap_group.add_argument(
+        "--imap-user",
+        dest="imap_user",
+        help="IMAP username/email account (default: from .env EMAIL_ACCOUNT)",
+    )
+    imap_group.add_argument(
+        "--imap-pass",
+        dest="imap_pass",
+        help="IMAP password (default: from .env EMAIL_PASSWORD)",
+    )
+
+    # Certificate settings
+    cert_group = parser.add_argument_group("S/MIME Certificate")
+    cert_group.add_argument(
+        "--cert",
+        dest="cert_path",
+        help="Path to P12/PFX certificate file (default: from .env P12_CERTIFICATE_PATH)",
+    )
+    cert_group.add_argument(
+        "--password",
+        dest="cert_password",
+        help="Certificate password (default: from .env PFX_PASSWORD)",
+    )
+
+    # Processing settings
+    process_group = parser.add_argument_group("Email Processing")
+    process_group.add_argument(
+        "--subject",
+        dest="subject_keyword",
+        help='Subject keyword to filter emails (default: from .env SUBJECT_KEYWORD or "Auftrag")',
+    )
+    process_group.add_argument(
+        "--output",
+        dest="output_dir",
+        help="Output directory for PDF attachments (default: from .env SAVE_DIRECTORY or ./output)",
+    )
+    process_group.add_argument(
+        "--email-action",
+        dest="email_action",
+        help='Action for successfully processed emails: mark_seen|delete|move:Folder (default: from .env EMAIL_ACTION or "mark_seen")',
+    )
+    process_group.add_argument(
+        "--duplicate-action",
+        dest="duplicate_action",
+        help='Action for older duplicate emails (same subject): mark_seen|delete|move:Folder (default: from .env DUPLICATE_ACTION or "mark_seen")',
+    )
+
+    # General options
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable verbose/debug logging"
+    )
+    parser.add_argument(
+        "--version", action="version", version="%(prog)s 0.2.0"
+    )
+
+    return parser.parse_args()
+
+
+def get_config_value(cli_value: Optional[str], env_key: str, default: str = None) -> Optional[str]:
+    """
+    Get configuration value with priority: CLI arg > .env > default.
+
+    Args:
+        cli_value: Value from command-line argument (None if not provided)
+        env_key: Environment variable key to check
+        default: Default value if neither CLI nor env is set
+
+    Returns:
+        Configuration value
+    """
+    if cli_value is not None:
+        return cli_value
+    return os.getenv(env_key, default)
+
+
 def main():
     """CLI entry point for amelis-smime-decrypt."""
 
+    # Parse command-line arguments
+    args = parse_arguments()
+
     # Configure logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Load configuration from environment
-    imap_server = os.getenv("IMAP_SERVER")
-    imap_port = int(os.getenv("IMAP_PORT", 993))
-    email_account = os.getenv("EMAIL_ACCOUNT")
-    email_password = os.getenv("EMAIL_PASSWORD")
-    p12_cert_path = os.getenv("P12_CERTIFICATE_PATH")
-    pfx_password = os.getenv("PFX_PASSWORD", "")
-    save_directory = os.getenv("SAVE_DIRECTORY", "./output")
-    subject_keyword = os.getenv("SUBJECT_KEYWORD", "Auftrag")
-    email_action_str = os.getenv("EMAIL_ACTION", "mark_seen")
-    duplicate_action_str = os.getenv("DUPLICATE_ACTION", "mark_seen")
+    # Load configuration: CLI args override .env values
+    imap_server = get_config_value(args.imap_server, "IMAP_SERVER")
+    imap_port = args.imap_port if args.imap_port is not None else int(os.getenv("IMAP_PORT", 993))
+    email_account = get_config_value(args.imap_user, "EMAIL_ACCOUNT")
+    email_password = get_config_value(args.imap_pass, "EMAIL_PASSWORD")
+    p12_cert_path = get_config_value(args.cert_path, "P12_CERTIFICATE_PATH")
+    pfx_password = get_config_value(args.cert_password, "PFX_PASSWORD", "")
+    save_directory = get_config_value(args.output_dir, "SAVE_DIRECTORY", "./output")
+    subject_keyword = get_config_value(args.subject_keyword, "SUBJECT_KEYWORD", "Auftrag")
+    email_action_str = get_config_value(args.email_action, "EMAIL_ACTION", "mark_seen")
+    duplicate_action_str = get_config_value(args.duplicate_action, "DUPLICATE_ACTION", "mark_seen")
 
     # Validate required configuration
     if not all([imap_server, email_account, email_password, p12_cert_path]):
