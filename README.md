@@ -7,7 +7,6 @@ A Python library and CLI tool that connects to an IMAP email mailbox, fetches S/
 ✔️ **IMAP Integration** - Connect to any IMAP email server<br>
 ✔️ **S/MIME Decryption** - Decrypt emails using P12/PFX certificates (RSA-OAEP support)<br>
 ✔️ **Subject Filtering** - Fetch emails matching specific keywords<br>
-✔️ **PDF Extraction** - Extract and save PDF attachments with optional data-driven renaming<br>
 ✔️ **Deduplication** - Automatically handle duplicate emails (same subject)<br>
 ✔️ **Flexible Actions** - Mark as seen, delete, or move emails after processing<br>
 ✔️ **CLI + Library** - Use as standalone tool or import as Python library<br>
